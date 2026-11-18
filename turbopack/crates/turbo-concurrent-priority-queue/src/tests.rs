@@ -295,7 +295,131 @@ fn busy_shard_is_skipped() {
     worker.join().unwrap();
     let (popped, shard) = result.expect("push and pop must not wait for a busy shard");
     assert_eq!(popped, Some(1));
-    assert_ne!(shard, 0, "the thread sticks to the shard it moved to");
+    assert_eq!(
+        shard, 0,
+        "the home shard only changes to a shard with high steal pressure"
+    );
+}
+
+fn steal_pressure<T>(q: &Queue<T>, index: usize) -> u32 {
+    q.shards[index].lock().steal_pressure
+}
+
+fn set_steal_pressure<T>(q: &Queue<T>, index: usize, pressure: u32) {
+    q.shards[index].lock().steal_pressure = pressure;
+}
+
+/// A steal from a shard raises its steal pressure, every pop from it lowers it (not below 0).
+#[test]
+fn steal_pressure_counts_steals_minus_pops() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(0, || (0..10).for_each(|item| q.push(5, item)));
+    assert_eq!(steal_pressure(&q, 0), 0);
+    on_shard(1, || q.pop()).unwrap();
+    assert_eq!(steal_pressure(&q, 0), 1, "one steal");
+    assert_eq!(
+        steal_pressure(&q, 1),
+        0,
+        "popping lowers the thief's counter"
+    );
+    on_shard(0, || q.pop()).unwrap();
+    assert_eq!(steal_pressure(&q, 0), 0);
+    on_shard(0, || q.pop()).unwrap();
+    assert_eq!(steal_pressure(&q, 0), 0, "saturates at 0");
+}
+
+/// Instead of stealing from a shard with high steal pressure, a thread makes that shard its home
+/// and pops from it directly; nothing is moved.
+#[test]
+fn high_steal_pressure_victim_becomes_home() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(0, || (0..10).for_each(|item| q.push(5, item)));
+    on_shard(1, || q.push(1, 100));
+    set_steal_pressure(&q, 0, STEAL_PRESSURE_THRESHOLD);
+    let (item, home) = on_shard(1, || {
+        let item = q.pop().unwrap().1;
+        (item, thread_shard())
+    });
+    assert_eq!(item, 9, "the newest item of the victim");
+    assert_eq!(home, 0, "the thread switched its home to the victim");
+    assert_eq!(shard_len(&q, 0), 9, "nothing was moved out of the victim");
+    assert_eq!(shard_len(&q, 1), 1, "the thief's shard is unchanged");
+    assert_eq!(
+        steal_pressure(&q, 0),
+        STEAL_PRESSURE_THRESHOLD - 1,
+        "a pop, not a steal"
+    );
+}
+
+/// Below the threshold, a thread still steals half.
+#[test]
+fn low_steal_pressure_victim_is_stolen_from() {
+    let q: Queue<u32> = Queue::new();
+    on_shard(0, || (0..10).for_each(|item| q.push(5, item)));
+    set_steal_pressure(&q, 0, STEAL_PRESSURE_THRESHOLD - 1);
+    let home = on_shard(1, || {
+        q.pop().unwrap();
+        thread_shard()
+    });
+    assert_eq!(home, 1);
+    assert_eq!(shard_len(&q, 0), 5);
+    assert_eq!(shard_len(&q, 1), 4);
+    assert_eq!(steal_pressure(&q, 0), STEAL_PRESSURE_THRESHOLD);
+}
+
+/// Runs `f` on a new thread whose home is shard 0 while shard 0 is locked; returns `f`'s result
+/// and the thread's home shard afterwards. Fails if `f` waits for shard 0.
+fn with_busy_home<R: Send + 'static>(
+    q: &Arc<Queue<u32>>,
+    f: impl FnOnce(&Queue<u32>) -> R + Send + 'static,
+) -> (R, usize) {
+    let guard = q.shards[0].lock();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = {
+        let q = q.clone();
+        std::thread::spawn(move || {
+            set_thread_shard(0);
+            let result = f(&q);
+            sender.send((result, thread_shard())).unwrap();
+        })
+    };
+    let result = receiver.recv_timeout(Duration::from_secs(5));
+    drop(guard);
+    worker.join().unwrap();
+    result.expect("must not wait for the busy home shard")
+}
+
+/// A push with a busy home shard uses another shard, but only moves home to a shard with high
+/// steal pressure.
+#[test]
+fn busy_home_push_switches_only_to_high_pressure_shard() {
+    let q: Arc<Queue<u32>> = Arc::new(Queue::new());
+    let ((), home) = with_busy_home(&q, |q| q.push(1, 1));
+    assert_eq!(home, 0);
+    assert_eq!(shard_len(&q, 0), 0, "pushed to another shard");
+
+    for index in 1..SHARD_COUNT {
+        set_steal_pressure(&q, index, STEAL_PRESSURE_THRESHOLD);
+    }
+    let ((), home) = with_busy_home(&q, |q| q.push(1, 2));
+    assert_ne!(
+        home, 0,
+        "moved home to the high pressure shard it pushed to"
+    );
+    assert!(shard_len(&q, home) > 0);
+}
+
+/// A pop with a busy home shard pops from a shard whose bit is set (it has items) and keeps its
+/// home.
+#[test]
+fn busy_home_pop_uses_shard_with_items() {
+    let q: Arc<Queue<u32>> = Arc::new(Queue::new());
+    on_shard(3, || q.push(2, 7));
+    let (popped, home) = with_busy_home(&q, |q| q.pop().map(|(_, item)| item));
+    assert_eq!(popped, Some(7));
+    assert_eq!(home, 0, "the home shard is kept");
+    assert!(all_shards_empty(&q));
+    assert_eq!(steal_pressure(&q, 3), 0, "a direct pop, not a steal");
 }
 
 /// Many threads push, pop, steal and search concurrently over many rounds. Checks that every item

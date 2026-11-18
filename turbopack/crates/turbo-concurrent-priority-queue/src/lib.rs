@@ -2,9 +2,9 @@
 //! [`ConcurrentPriorityQueue`].
 //!
 //! The queue is a set of [`SHARD_COUNT`] mutex-protected shards plus one shared atomic state word.
-//! A thread sticks to one shard (a thread-local index), so in the common case pushes and pops of
-//! different threads take different, uncontended locks. Threads that run out of work at the
-//! highest priority steal half of another shard's items at that priority.
+//! A thread sticks to one shard, its *home* (a thread-local index), so in the common case pushes
+//! and pops of different threads take different, uncontended locks. Threads that run out of work
+//! at the highest priority steal half of another shard's items at that priority.
 //!
 //! # Shards
 //!
@@ -12,6 +12,23 @@
 //! of these priorities (one heap entry per distinct priority, not per item). Items with the same
 //! priority are popped in LIFO order *within a shard* (the newest first, which keeps recently
 //! queued work hot); across shards there is no order among equal priorities.
+//!
+//! # Home shards and steal pressure
+//!
+//! Every shard counts its *steal pressure*: steals from it minus pops from it, never below `0`. A
+//! high value (4 or more) means other threads keep stealing from the shard while nobody pops from
+//! it, e.g. because its home thread is busy elsewhere.
+//!
+//! - A pop locks its home shard. If that is busy, it tries shards whose bit is set in the state
+//!   word (they may have items at `highest`; the pop revalidates under the lock), and blocks on its
+//!   home shard after a bounded number of attempts.
+//! - A push locks its home shard. If that is busy, it tries other shards, and blocks on its home
+//!   shard after a bounded number of attempts.
+//! - A thread that uses a shard other than its home for a push or pop only moves its home there
+//!   when that shard has high steal pressure.
+//! - Instead of stealing from a victim with high steal pressure, a thread moves its home to the
+//!   victim and pops from it directly: the victim's own thread isn't popping it, so the thief takes
+//!   over the shard instead of moving half of it again and again.
 //!
 //! # The state word
 //!
@@ -65,7 +82,9 @@
 //! - **Steal:** if shard `i` doesn't have `highest`, keep holding its lock and `try_lock` a shard
 //!   `j` whose bit is set. If `j` has `highest`, move half (rounded up) of its items at that
 //!   priority, the newest ones, to shard `i`, publish `i`, then clear bit `j` if `j` no longer has
-//!   `highest`. If `j` doesn't have `highest`, clear its spurious bit.
+//!   `highest`. If `j` has high steal pressure, pop from `j` instead (like a pop from `j`, with the
+//!   same bit maintenance) and make `j` the thread's home. If `j` doesn't have `highest`, clear its
+//!   spurious bit.
 //! - **Start a search:** `(highest > 0, not searching, bits == 0)` → `(0, SEARCHING, 0)`. By I2 no
 //!   shard has `highest` any more, and by I1 none has more, so `highest` is stale. (With `highest
 //!   == 0` and no bits the queue is empty instead, I4.)
@@ -92,9 +111,14 @@
 //!   `highest` is raised and then drained so that a search starts while the thief still holds both
 //!   locks, the thief's publish of its own shard counts as a check of it, and the victim is checked
 //!   after the thief released it.
-//! - *Contention:* a thread that fails to `try_lock` its shard moves on to another one (and stays
-//!   there). After a bounded number of attempts it blocks on a lock instead, so a pop never returns
-//!   `None` just because shards were busy (I4).
+//! - *Contention:* a thread that fails to `try_lock` its home shard tries other shards (for a pop,
+//!   only shards whose bit is set). After a bounded number of attempts it blocks on its home shard
+//!   instead, so a pop never returns `None` just because shards were busy (I4). A pop only picks
+//!   shards by their bit outside of a search (during a search it helps the search), where a set bit
+//!   means the shard may have `highest` (I2). A spurious bit only costs a retry: the pop sees the
+//!   shard doesn't have `highest`, clears the bit and steals or starts over.
+//! - *Home switches* only change thread-local state, and the steal pressure is only read or written
+//!   under its shard's lock, so neither affects the invariants above.
 //!
 //! ## Ordering guarantee
 //!
@@ -154,6 +178,9 @@ const SEARCHING: u64 = 1 << SHARD_COUNT;
 const HIGHEST_SHIFT: u32 = 32;
 /// How many shards a thread tries with `try_lock` before it blocks on a lock.
 const TRY_LOCK_ATTEMPTS: usize = 4;
+/// The steal pressure (steals minus pops) from which a shard is taken over by a thread that wants
+/// to steal from it, or that happens to use it, instead of being stolen from. See the crate docs.
+const STEAL_PRESSURE_THRESHOLD: u32 = 4;
 
 fn state_highest(state: u64) -> u32 {
     (state >> HIGHEST_SHIFT) as u32
@@ -222,6 +249,8 @@ fn random_shard() -> usize {
 struct Shard<P, T> {
     buckets: FxHashMap<P, Vec<T>>,
     heap: BinaryHeap<P>,
+    /// Steals from this shard minus pops from it, saturating at `0`.
+    steal_pressure: u32,
 }
 
 impl<P: Clone + Ord + Hash + QueuePriority, T> Shard<P, T> {
@@ -229,7 +258,13 @@ impl<P: Clone + Ord + Hash + QueuePriority, T> Shard<P, T> {
         Self {
             buckets: FxHashMap::default(),
             heap: BinaryHeap::new(),
+            steal_pressure: 0,
         }
+    }
+
+    /// Whether other threads keep stealing from this shard while nobody pops from it.
+    fn has_high_steal_pressure(&self) -> bool {
+        self.steal_pressure >= STEAL_PRESSURE_THRESHOLD
     }
 
     fn top_rank(&self) -> Option<u32> {
@@ -266,9 +301,10 @@ impl<P: Clone + Ord + Hash + QueuePriority, T> Shard<P, T> {
         }
     }
 
-    /// Removes the newest item of the top priority.
+    /// Removes the newest item of the top priority, and lowers the steal pressure.
     fn pop_top(&mut self) -> Option<(P, T)> {
         let priority = self.heap.peek()?.clone();
+        self.steal_pressure = self.steal_pressure.saturating_sub(1);
         let bucket = self.buckets.get_mut(&priority).unwrap();
         let item = bucket.pop().unwrap();
         if bucket.is_empty() {
@@ -278,9 +314,11 @@ impl<P: Clone + Ord + Hash + QueuePriority, T> Shard<P, T> {
         Some((priority, item))
     }
 
-    /// Removes half (rounded up) of the items of the top priority, the newest ones.
+    /// Removes half (rounded up) of the items of the top priority, the newest ones, for a steal,
+    /// and raises the steal pressure.
     fn take_half_top(&mut self) -> Option<(P, Vec<T>)> {
         let priority = self.heap.peek()?.clone();
+        self.steal_pressure = self.steal_pressure.saturating_add(1);
         let bucket = self.buckets.get_mut(&priority).unwrap();
         let count = bucket.len().div_ceil(2);
         if count == bucket.len() {
@@ -342,21 +380,60 @@ impl<P: Clone + Ord + Hash + QueuePriority, T> ConcurrentPriorityQueue<P, T> {
             || self.shards.iter().all(|shard| shard.lock().is_empty())
     }
 
-    /// Locks the thread's shard, or another one if that is busy. Blocks on a lock only after
-    /// [`TRY_LOCK_ATTEMPTS`] failed attempts. A thread that moved to another shard stays there.
+    /// Locks the thread's home shard for a push, or another one if that is busy. Blocks on the home
+    /// shard only after [`TRY_LOCK_ATTEMPTS`] failed attempts.
     fn lock_some_shard(&self) -> (usize, MutexGuard<'_, Shard<P, T>>) {
         let home = thread_shard();
-        let mut index = home;
-        for _ in 0..TRY_LOCK_ATTEMPTS {
+        if let Some(guard) = self.shards[home].try_lock() {
+            return (home, guard);
+        }
+        for _ in 1..TRY_LOCK_ATTEMPTS {
+            let index = random_shard();
             if let Some(guard) = self.shards[index].try_lock() {
-                if index != home {
-                    set_thread_shard(index);
-                }
+                Self::visit_shard(home, index, &guard);
                 return (index, guard);
             }
-            index = random_shard();
         }
         (home, self.shards[home].lock())
+    }
+
+    /// Locks the thread's home shard for a pop, or, if that is busy, a shard whose bit is set in
+    /// `state` (not searching), so it may have items at the highest priority. The caller
+    /// revalidates under the lock. Blocks on the home shard only after [`TRY_LOCK_ATTEMPTS`]
+    /// failed attempts or when no other bit is set.
+    fn lock_shard_for_pop(&self, state: u64) -> (usize, MutexGuard<'_, Shard<P, T>>) {
+        let home = thread_shard();
+        if let Some(guard) = self.shards[home].try_lock() {
+            return (home, guard);
+        }
+        let candidates = state_bits(state) & !shard_bit(home);
+        if candidates != 0 {
+            let start = random_shard();
+            let mut attempts = 1;
+            for offset in 0..SHARD_COUNT {
+                let index = (start + offset) % SHARD_COUNT;
+                if candidates & shard_bit(index) == 0 {
+                    continue;
+                }
+                if let Some(guard) = self.shards[index].try_lock() {
+                    Self::visit_shard(home, index, &guard);
+                    return (index, guard);
+                }
+                attempts += 1;
+                if attempts >= TRY_LOCK_ATTEMPTS {
+                    break;
+                }
+            }
+        }
+        (home, self.shards[home].lock())
+    }
+
+    /// Called when a thread uses shard `index` (whose lock it holds) instead of its `home` shard:
+    /// it only moves its home there when that shard has high steal pressure.
+    fn visit_shard(home: usize, index: usize, shard: &Shard<P, T>) {
+        if index != home && shard.has_high_steal_pressure() {
+            set_thread_shard(index);
+        }
     }
 
     /// Queues `item` with `priority`.
@@ -541,7 +618,7 @@ impl<P: Clone + Ord + Hash + QueuePriority, T> ConcurrentPriorityQueue<P, T> {
                 );
                 continue;
             }
-            let (index, mut shard) = self.lock_some_shard();
+            let (index, mut shard) = self.lock_shard_for_pop(state);
             match self.pop_locked(index, &mut shard) {
                 ShardPop::Item(priority, item) => return Some((priority, item)),
                 ShardPop::Retry => continue,
@@ -573,7 +650,9 @@ impl<P: Clone + Ord + Hash + QueuePriority, T> ConcurrentPriorityQueue<P, T> {
     }
 
     /// Steals half of the items at the highest priority from a shard whose bit is set into shard
-    /// `index` (whose lock the caller holds), and pops one of them. See "Steal" in the crate docs.
+    /// `index` (whose lock the caller holds), and pops one of them. A victim with high steal
+    /// pressure is taken over instead: the thread makes it its home and pops from it directly. See
+    /// "Steal" in the crate docs.
     fn steal(&self, index: usize, shard: &mut Shard<P, T>) -> Option<(P, T)> {
         let state = self.state.load(Ordering::Acquire);
         if state == 0 || is_searching(state) {
@@ -597,6 +676,14 @@ impl<P: Clone + Ord + Hash + QueuePriority, T> ConcurrentPriorityQueue<P, T> {
             if !victim.has_rank(highest) {
                 self.clear_bit_if_highest(victim_index, highest);
                 continue;
+            }
+            if victim.has_high_steal_pressure() {
+                set_thread_shard(victim_index);
+                return match self.pop_locked(victim_index, &mut victim) {
+                    ShardPop::Item(priority, item) => Some((priority, item)),
+                    // The state changed (e.g. a higher priority was pushed): let `pop` start over.
+                    ShardPop::NotHighest | ShardPop::Retry => None,
+                };
             }
             let (priority, items) = victim.take_half_top().unwrap();
             shard.push_many(priority, items);
