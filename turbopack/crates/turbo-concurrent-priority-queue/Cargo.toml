@@ -12,3 +12,11 @@ workspace = true
 crossbeam-utils = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
+
+[dev-dependencies]
+concurrent-queue = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "scaling"
+harness = false
